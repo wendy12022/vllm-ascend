@@ -22,6 +22,7 @@ from typing import ClassVar, List, Optional, Tuple, Type
 import torch
 import torch.nn as nn
 import torch_npu
+import os
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.config import VllmConfig
@@ -37,7 +38,7 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
 from vllm_ascend.compilation.acl_graph import (get_graph_params,
                                                update_graph_params_workspaces)
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
-from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
+from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p, is_910a,
                                nd_to_nz_2d, nd_to_nz_spec)
 
 from ..utils import weak_ref_tensors
@@ -330,6 +331,87 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.key_cache = None
         self.value_cache = None
 
+
+    def _forward_prefill_no_cache_910a_kvgroup(self, query, key, value, attn_metadata, output, num_tokens=0):
+        """Per-KV-head 分组版本：将同 KV-head 的 Q-heads 打包计算，ki.T 只算一次。
+
+        相比逐 Q-head 版本：
+        - kernel launch 数减少 n_rep 倍 (TP=8 时 32B: 8x减少, 8B: 4x减少)
+        - matmul M 维度放大 n_rep 倍 → Cube 单元利用率更高
+        """
+        real_len = num_tokens
+        if attn_metadata.attn_mask is not None:
+            mask_size = attn_metadata.attn_mask.shape[-1]
+            real_len = min(num_tokens, mask_size)
+
+        q = query[:real_len]
+        k = key[:real_len]
+        v = value[:real_len]
+
+        q = q.transpose(0, 1)  # [num_q_heads, N, dim]
+        k = k.transpose(0, 1)  # [num_kv_heads, N, dim]
+        v = v.transpose(0, 1)  # [num_kv_heads, N, dim]
+
+        num_q_heads = q.shape[0]
+        num_kv_heads = k.shape[0]
+        n_rep = num_q_heads // num_kv_heads
+        head_dim = self.head_size
+
+        # 临时恢复自适应版本，排除 Q_CHUNK_KV 变化导致性能回退
+        chunk_mb = int(os.environ.get('VLLM_910A_ATTN_CHUNK_MB', '600'))
+        TARGET_BYTES = max(64_000_000, min(2_000_000_000, chunk_mb * 1_000_000))
+        Q_CHUNK_KV = max(64, min(2048, TARGET_BYTES // max(1, n_rep * real_len * 4)))
+
+        full_mask = attn_metadata.attn_mask if attn_metadata.attn_mask is not None else None
+        orig_dtype = q.dtype
+
+        try:
+            # 预分配输出，直接写入，省掉 cat+transpose+contiguous
+            final_out = torch.empty(real_len, num_q_heads, head_dim,
+                                   dtype=orig_dtype, device=q.device)
+
+            for kv_idx in range(num_kv_heads):
+                ki_t = k[kv_idx:kv_idx+1].transpose(-2, -1)  # [1, dim, N] — 只算1次!
+                vi = v[kv_idx:kv_idx+1]                       # [1, N, dim]
+
+                q_start = kv_idx * n_rep
+                q_end = q_start + n_rep
+                qi_group = q[q_start:q_end]  # [n_rep, N, dim]
+
+                for chunk_start in range(0, real_len, Q_CHUNK_KV):
+                    chunk_end = min(chunk_start + Q_CHUNK_KV, real_len)
+                    qi_chunk = qi_group[:, chunk_start:chunk_end]  # [n_rep, Qc, dim]
+
+                    attn_chunk = torch.matmul(qi_chunk, ki_t) * self.scale
+
+                    if full_mask is not None:
+                        mask_chunk = full_mask[chunk_start:chunk_end, :real_len]
+                        mask_chunk = torch.where(
+                            torch.isinf(mask_chunk),
+                            torch.tensor(-10000.0, device=q.device, dtype=torch.float32),
+                            mask_chunk.float())
+                        attn_chunk = attn_chunk.float() + mask_chunk
+                        del mask_chunk
+                    else:
+                        attn_chunk = attn_chunk.float()
+
+                    p_chunk = torch.softmax(attn_chunk, dim=-1).to(orig_dtype)
+                    del attn_chunk
+
+                    out_chunk = torch.matmul(p_chunk, vi)  # [n_rep, Qc, dim]
+                    # 直接写入预分配的输出 (Q-heads维度已按KV-head分组)
+                    final_out[chunk_start:chunk_end, q_start:q_end] = out_chunk.transpose(0, 1)
+                    del p_chunk, out_chunk
+
+            output[:real_len, :, :] = final_out
+            del final_out
+
+        except Exception as e:
+            print(f"CRITICAL: Prefill Logic Failed at real_len {real_len}! Error: {e}")
+            raise e
+
+        return output[:num_tokens]
+
     def _forward_prefill_no_cache(
         self,
         query: torch.Tensor,
@@ -392,6 +474,57 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_heads=self.num_heads,
             scale_value=self.scale,
             out=output)
+        return output
+
+    def _forward_decode_only_910a(
+    self,
+    query: torch.Tensor,
+    attn_metadata: AscendMetadata,
+    output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Decode attention with per-KV-head batched matmul（无 repeat_interleave）。
+
+        Q reshape 为 [kv_h, n_rep, d], K/V 保持 [kv_h, ...]，
+        一次 batched matmul 完成所有 KV-head 的 attention 计算。
+        """
+        batch_size = query.shape[0]
+        if output is None:
+            output = torch.empty_like(query)
+
+        num_kv_heads = self.num_kv_heads
+        head_size = self.head_size
+        block_size = self.key_cache.shape[1]
+        n_rep = self.num_heads // self.num_kv_heads
+        orig_dtype = query.dtype
+
+        for i in range(batch_size):
+            seq_len = attn_metadata.seq_lens[i].item()
+            block_table = attn_metadata.block_tables[i]
+
+            num_needed_blocks = (seq_len + block_size - 1) // block_size
+            curr_blocks = block_table[:num_needed_blocks].to(torch.long)
+
+            # 从 Cache 提取 KV, 保持原始 dtype 避免额外显存
+            k_cur = self.key_cache[curr_blocks].view(-1, num_kv_heads, head_size)[:seq_len]
+            v_cur = self.value_cache[curr_blocks].view(-1, num_kv_heads, head_size)[:seq_len]
+
+            # Q: [num_heads, d] → [num_kv_heads, n_rep, d]
+            q_i = query[i].view(num_kv_heads, n_rep, head_size)
+            # K: [seq_len, kv_h, d] → [kv_h, d, seq_len]
+            k_i = k_cur.permute(1, 2, 0)
+            # V: [seq_len, kv_h, d] → [kv_h, seq_len, d]
+            v_i = v_cur.permute(1, 0, 2)
+
+            # batched matmul: [kv_h, n_rep, d] × [kv_h, d, seq_len] → [kv_h, n_rep, seq_len]
+            attn_scores = torch.matmul(q_i, k_i) * self.scale
+            attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(orig_dtype)
+
+            # batched matmul: [kv_h, n_rep, seq_len] × [kv_h, seq_len, d] → [kv_h, n_rep, d]
+            out_i = torch.matmul(attn_probs, v_i)
+            out_i = out_i.reshape(self.num_heads, head_size)
+
+            output[i].copy_(out_i)
+
         return output
 
     def _forward_decode_only(
@@ -627,53 +760,110 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = value.view(-1, self.num_kv_heads, self.head_size)
             # TODO: Remove this contiguous in the future.
             value = value.contiguous()
-
+            
             if len(kv_cache) > 1:
-                if self.key_cache is None:
-                    self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
-                slots = attn_metadata.slot_mapping
-                torch_npu._npu_reshape_and_cache(
-                    key=key[:num_actual_tokens],
-                    value=value[:num_actual_tokens],
-                    key_cache=self.key_cache,
-                    value_cache=self.value_cache,
-                    slot_indices=slots)
-            if attn_type == AttentionType.ENCODER_ONLY:
-                cum_seq_len = attn_metadata.query_start_loc[1:].tolist()
-                attn_out = torch_npu.npu_fusion_attention(
-                    query,
-                    key,
-                    value,
-                    head_num=self.num_heads,
-                    input_layout="TND",
-                    scale=self.scale,
-                    sparse_mode=4,
-                    atten_mask=attn_metadata.attn_mask,
-                    pre_tockens=attn_metadata.max_query_len,
-                    next_tockens=attn_metadata.max_query_len,
-                    actual_seq_qlen=cum_seq_len,
-                    actual_seq_kvlen=cum_seq_len,
-                )
-                output = attn_out[0]
-            # V0-Style scheduler situation.
-            elif attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
-                output = self._forward_prefill_no_cache(
-                    query, key, value, attn_metadata, output, num_tokens)
-            elif attn_metadata.attn_state == \
-                AscendAttentionState.PrefillCacheHit:
-                output = self._forward_prefill_cache_hit(
-                    query, attn_metadata, output)
-            elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-                output = self._forward_decode_only(query, attn_metadata,
-                                                   output)
-            # Normal V1 situation.
-            else:
-                # npu_fused_infer_attention_score does not support cases
-                # where query.shape[0] != attn_metadata.query_start_loc[-1].
-                # Thus we need unpad it here.
-                num_tokens = attn_metadata.query_start_loc[-1]
-                query = query[:num_tokens]
-                output = self._forward_v1_style(query, attn_metadata, output)
+                if is_910a():
+                    if self.key_cache is None:
+                        self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+                    
+                    current_block_size = getattr(attn_metadata, 'block_size', self.key_cache.shape[1])
+                    key_fixed = key.contiguous()
+                    value_fixed = value.contiguous()                    
+                    
+                    # 910A IndexPut 不支持，改为：slot_mapping 一次性搬 CPU → 按 block 分组 → 连续 slot 批量 copy_
+                    s_map_cpu = attn_metadata.slot_mapping.flatten().cpu().tolist()
+
+                    block_groups = {}
+                    for i in range(num_actual_tokens):
+                        slot = s_map_cpu[i]
+                        if slot < 0:
+                            continue
+                        b_idx = slot // current_block_size
+                        s_idx = slot % current_block_size
+                        block_groups.setdefault(b_idx, []).append((i, s_idx))
+
+                    for b_idx, tokens in block_groups.items():
+                        tokens.sort(key=lambda x: x[1])
+                        run_start = 0
+                        for j in range(1, len(tokens) + 1):
+                            if j == len(tokens) or tokens[j][1] != tokens[j - 1][1] + 1:
+                                t0 = tokens[run_start][0]
+                                t1 = tokens[j - 1][0] + 1
+                                s0 = tokens[run_start][1]
+                                s1 = tokens[j - 1][1] + 1
+                                self.key_cache[b_idx, s0:s1].copy_(key_fixed[t0:t1])
+                                self.value_cache[b_idx, s0:s1].copy_(value_fixed[t0:t1])
+                                run_start = j
+
+                else:
+                    if self.key_cache is None:
+                        self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+                    slots = attn_metadata.slot_mapping
+                    torch_npu._npu_reshape_and_cache(
+                        key=key[:num_actual_tokens],
+                        value=value[:num_actual_tokens],
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        slot_indices=slots)
+            
+            if is_910a():        
+                # V0-Style scheduler situation.
+                if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+                    # GQA (n_rep>1) 时用 per-KV-head 分组: 减少 kernel launch + 提升 Cube 利用率
+                    if self.num_heads > self.num_kv_heads:
+                        output = self._forward_prefill_no_cache_910a_kvgroup(
+                                query, key, value, attn_metadata, output, num_tokens)
+                    else:
+                        output = self._forward_prefill_no_cache_910a(
+                            query, key, value, attn_metadata, output, num_tokens)
+                elif attn_metadata.attn_state == \
+                    AscendAttentionState.PrefillCacheHit:
+                    output = self._forward_prefill_cache_hit(
+                        query, attn_metadata, output)
+                elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                    output = self._forward_decode_only_910a(query, attn_metadata,
+                                                    output)
+                # Normal V1 situation.
+                else:
+                    output = self._forward_v1_style(query, attn_metadata, output)        
+                
+            else :        
+                if attn_type == AttentionType.ENCODER_ONLY:
+                    cum_seq_len = attn_metadata.query_start_loc[1:].tolist()
+                    attn_out = torch_npu.npu_fusion_attention(
+                        query,
+                        key,
+                        value,
+                        head_num=self.num_heads,
+                        input_layout="TND",
+                        scale=self.scale,
+                        sparse_mode=4,
+                        atten_mask=attn_metadata.attn_mask,
+                        pre_tockens=attn_metadata.max_query_len,
+                        next_tockens=attn_metadata.max_query_len,
+                        actual_seq_qlen=cum_seq_len,
+                        actual_seq_kvlen=cum_seq_len,
+                    )
+                    output = attn_out[0]
+                # V0-Style scheduler situation.
+                elif attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+                    output = self._forward_prefill_no_cache(
+                        query, key, value, attn_metadata, output, num_tokens)
+                elif attn_metadata.attn_state == \
+                    AscendAttentionState.PrefillCacheHit:
+                    output = self._forward_prefill_cache_hit(
+                        query, attn_metadata, output)
+                elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
+                    output = self._forward_decode_only(query, attn_metadata,
+                                                    output)
+                # Normal V1 situation.
+                else:
+                    # npu_fused_infer_attention_score does not support cases
+                    # where query.shape[0] != attn_metadata.query_start_loc[-1].
+                    # Thus we need unpad it here.
+                    num_tokens = attn_metadata.query_start_loc[-1]
+                    query = query[:num_tokens]
+                    output = self._forward_v1_style(query, attn_metadata, output)
 
         # to make in-place change to the output tensor
         if hasattr(layer, 'quant_method') and use_kv_cache_int8:

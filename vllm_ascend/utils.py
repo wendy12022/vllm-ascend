@@ -49,6 +49,7 @@ ACL_FORMAT_FRACTAL_NZ = 29
 
 _CUSTOM_OP_ENABLED = None
 _IS_310P = None
+_IS_910A = None
 _SLEEP_MODE_ENABLED = None
 _CURRENT_STREAM = None
 _PREFETCH_STREAM = None
@@ -70,6 +71,16 @@ def is_310p():
         from vllm_ascend import _build_info  # type: ignore
         _IS_310P = _build_info.__soc_version__.lower().startswith("ascend310p")
     return _IS_310P
+
+def is_910a():
+    global _IS_910A
+    if _IS_910A is None:
+        soc_version = torch_npu.npu.get_soc_version()
+        # 如果在910A上执行，需要保证这个_IS_910A为True。当前判断并没有保证包含所有910a的判断。请根据自己的芯片输出version添加。
+        _IS_910A = 100 <= soc_version <= 104
+    if not _IS_910A:
+        print("[WARNING]: _IS_910A is False. This patch was developed for 910A. Confirm that the current environment is not 910A.")
+    return _IS_910A
 
 
 def is_enable_nz(dtype: Optional[torch.dtype] = torch.int8,
@@ -213,6 +224,7 @@ def enable_custom_op():
     """
     global _CUSTOM_OP_ENABLED
     if _CUSTOM_OP_ENABLED is not None:
+        logger.warning("enable_custom_op  return {}".format(_CUSTOM_OP_ENABLED))
         return _CUSTOM_OP_ENABLED
     try:
         # isort: off
@@ -227,6 +239,7 @@ def enable_custom_op():
         logger.warning(
             "Warning: Failed to register custom ops, all custom ops will be disabled"
         )
+    logger.warning("enable_custom_op  return {}".format(_CUSTOM_OP_ENABLED))
     return _CUSTOM_OP_ENABLED
 
 
@@ -622,6 +635,7 @@ def register_ascend_customop(vllm_config: Optional[VllmConfig] = None):
 class AscendSocVersion(Enum):
     A2 = 0
     A3 = 1
+    A1 = 3
     UNDEFINED = 2
 
 
@@ -635,6 +649,8 @@ def init_ascend_soc_version():
         _ascend_soc_version = AscendSocVersion.A2
     elif 250 <= soc_version <= 255:
         _ascend_soc_version = AscendSocVersion.A3
+    elif is_910a():
+        _ascend_soc_version = AscendSocVersion.A1
     else:
         _ascend_soc_version = AscendSocVersion.UNDEFINED
 

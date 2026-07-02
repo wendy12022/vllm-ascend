@@ -32,7 +32,7 @@ def _addrmsnorm_forward_oot(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     import torch_npu
 
-    from vllm_ascend.utils import is_310p
+    from vllm_ascend.utils import is_310p, is_910a
 
     if layer is not None and not is_310p():
         layer_cls_name = layer.__class__.__name__
@@ -67,7 +67,7 @@ def _addrmsnorm_forward_oot(
             )
 
     else:
-        if is_310p():
+        if is_310p() or is_910a():
             orig_dtype = residual.dtype
             x = x + residual.to(x.dtype)
             residual = x.to(orig_dtype)
